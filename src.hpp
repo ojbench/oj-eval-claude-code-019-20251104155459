@@ -75,41 +75,89 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(row_soft);
     }
 
-    // Compute Y via outer-product accumulation to reduce MatMul cost:
-    // Y = sum_j (col_j(W) @ row_j(V_stack)) where col_j is (i+1,1), row_j is (1,d)
-    Matrix *Y = nullptr;
+    // Streaming attention computation: build Y row-by-row without forming S/E/W or K/V stacks.
+    // Precondition: Q is in shared memory.
+    // For efficiency, move needed K[j] and V[j] to shared memory once, and transpose K[j] in-place.
     for (size_t j = 0; j <= i; ++j) {
-      Matrix *w_col = matrix_memory_allocator.Allocate("w_col");
-      gpu_sim.GetColumn(W, j, w_col, Position::kInSharedMemory);
-      Matrix *v_row = matrix_memory_allocator.Allocate("v_row");
-      gpu_sim.GetRow(V_stack, j, v_row, Position::kInSharedMemory);
-      Matrix *outer = matrix_memory_allocator.Allocate("outer");
-      gpu_sim.MatMul(w_col, v_row, outer); // (i+1,1) x (1,d) -> (i+1,d)
-
-      if (j == 0) {
-        Y = matrix_memory_allocator.Allocate("answer");
-        gpu_sim.Copy(outer, Y, Position::kInSharedMemory);
-      } else {
-        Matrix *acc = matrix_memory_allocator.Allocate("acc");
-        gpu_sim.MatAdd(Y, outer, acc);
-        gpu_sim.ReleaseMatrix(Y);
-        Y = acc;
+      gpu_sim.MoveMatrixToSharedMem(keys[j]);
+      gpu_sim.MoveMatrixToSharedMem(values[j]);
+      // Transpose keys[j] to shape (512,1) if still (1,512)
+      if (keys[j]->GetColumnNum() == 512 && keys[j]->GetRowNum() == 1) {
+        gpu_sim.Transpose(keys[j], Position::kInSharedMemory);
       }
-      gpu_sim.ReleaseMatrix(w_col);
-      gpu_sim.ReleaseMatrix(v_row);
-      gpu_sim.ReleaseMatrix(outer);
+    }
+
+    Matrix *Y = nullptr; // final answer (i+1, d)
+    for (size_t r = 0; r <= i; ++r) {
+      // Get Q row r in shared memory: (1, d)
+      Matrix *Q_row = matrix_memory_allocator.Allocate("Q_row");
+      gpu_sim.GetRow(Q, r, Q_row, Position::kInSharedMemory);
+
+      // Numerator accumulator y_num (1, d), Denominator denom (1,1)
+      Matrix *y_num = nullptr;
+      Matrix *denom = nullptr;
+
+      for (size_t j = 0; j <= i; ++j) {
+        // s_rj = Q_row (1,d) @ K[j] (512,1) -> (1,1)
+        Matrix *s_rj = matrix_memory_allocator.Allocate("s_rj");
+        gpu_sim.MatMul(Q_row, keys[j], s_rj);
+        Matrix *e_rj = matrix_memory_allocator.Allocate("e_rj");
+        gpu_sim.MatExp(s_rj, e_rj);
+
+        // Accumulate denom
+        if (j == 0) {
+          denom = matrix_memory_allocator.Allocate("denom");
+          gpu_sim.Copy(e_rj, denom, Position::kInSharedMemory);
+        } else {
+          Matrix *den_new = matrix_memory_allocator.Allocate("den_new");
+          gpu_sim.MatAdd(denom, e_rj, den_new);
+          gpu_sim.ReleaseMatrix(denom);
+          denom = den_new;
+        }
+
+        // Accumulate y_num += e_rj * V[j]
+        Matrix *scaled_v = matrix_memory_allocator.Allocate("scaled_v");
+        gpu_sim.MatMulNum(values[j], e_rj, scaled_v);
+        if (j == 0) {
+          y_num = matrix_memory_allocator.Allocate("y_num");
+          gpu_sim.Copy(scaled_v, y_num, Position::kInSharedMemory);
+        } else {
+          Matrix *y_new = matrix_memory_allocator.Allocate("y_new");
+          gpu_sim.MatAdd(y_num, scaled_v, y_new);
+          gpu_sim.ReleaseMatrix(y_num);
+          y_num = y_new;
+        }
+
+        // Release small temporaries
+        gpu_sim.ReleaseMatrix(s_rj);
+        gpu_sim.ReleaseMatrix(e_rj);
+        gpu_sim.ReleaseMatrix(scaled_v);
+      }
+
+      // y_r = y_num / denom -> (1, d)
+      Matrix *y_r = matrix_memory_allocator.Allocate("y_row");
+      gpu_sim.MatDiv(y_num, denom, y_r);
+
+      // Append to Y
+      if (r == 0) {
+        Y = matrix_memory_allocator.Allocate("answer");
+        gpu_sim.Copy(y_r, Y, Position::kInSharedMemory);
+      } else {
+        Matrix *Y_new = matrix_memory_allocator.Allocate("Y_new");
+        gpu_sim.Concat(Y, y_r, Y_new, /*axis=*/0, Position::kInSharedMemory);
+        gpu_sim.ReleaseMatrix(Y);
+        Y = Y_new;
+      }
+
+      // Release per-row accumulators
+      gpu_sim.ReleaseMatrix(Q_row);
+      gpu_sim.ReleaseMatrix(y_num);
+      gpu_sim.ReleaseMatrix(denom);
+      gpu_sim.ReleaseMatrix(y_r);
     }
 
     // Move answer to HBM before committing
     gpu_sim.MoveMatrixToGpuHbm(Y);
-
-    // Optionally release intermediates to reduce SRAM usage
-    gpu_sim.ReleaseMatrix(S);
-    gpu_sim.ReleaseMatrix(E);
-    gpu_sim.ReleaseMatrix(W);
-    // K_stack was transposed in-place and no longer needed
-    gpu_sim.ReleaseMatrix(K_stack);
-    gpu_sim.ReleaseMatrix(V_stack);
 
     // Run queued instructions, then commit the answer from HBM
     gpu_sim.Run(false, &matrix_memory_allocator);
