@@ -75,9 +75,30 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(row_soft);
     }
 
-    // Y = W (i+1,i+1) @ V_stack (i+1,d) -> (i+1,d)
-    Matrix *Y = matrix_memory_allocator.Allocate("answer");
-    gpu_sim.MatMul(W, V_stack, Y);
+    // Compute Y via outer-product accumulation to reduce MatMul cost:
+    // Y = sum_j (col_j(W) @ row_j(V_stack)) where col_j is (i+1,1), row_j is (1,d)
+    Matrix *Y = nullptr;
+    for (size_t j = 0; j <= i; ++j) {
+      Matrix *w_col = matrix_memory_allocator.Allocate("w_col");
+      gpu_sim.GetColumn(W, j, w_col, Position::kInSharedMemory);
+      Matrix *v_row = matrix_memory_allocator.Allocate("v_row");
+      gpu_sim.GetRow(V_stack, j, v_row, Position::kInSharedMemory);
+      Matrix *outer = matrix_memory_allocator.Allocate("outer");
+      gpu_sim.MatMul(w_col, v_row, outer); // (i+1,1) x (1,d) -> (i+1,d)
+
+      if (j == 0) {
+        Y = matrix_memory_allocator.Allocate("answer");
+        gpu_sim.Copy(outer, Y, Position::kInSharedMemory);
+      } else {
+        Matrix *acc = matrix_memory_allocator.Allocate("acc");
+        gpu_sim.MatAdd(Y, outer, acc);
+        gpu_sim.ReleaseMatrix(Y);
+        Y = acc;
+      }
+      gpu_sim.ReleaseMatrix(w_col);
+      gpu_sim.ReleaseMatrix(v_row);
+      gpu_sim.ReleaseMatrix(outer);
+    }
 
     // Move answer to HBM before committing
     gpu_sim.MoveMatrixToGpuHbm(Y);
