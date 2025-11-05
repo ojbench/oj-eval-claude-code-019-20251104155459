@@ -117,7 +117,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
 
         // Accumulate y_num += e_rj * V[j]
         Matrix *scaled_v = matrix_memory_allocator.Allocate("scaled_v");
-        gpu_sim.MatMulNum(values[j], e_rj, scaled_v);
+        gpu_sim.MatMul(e_rj, values[j], scaled_v);
         if (j == 0) {
           y_num = matrix_memory_allocator.Allocate("y_num");
           gpu_sim.Copy(scaled_v, y_num, Position::kInSharedMemory);
