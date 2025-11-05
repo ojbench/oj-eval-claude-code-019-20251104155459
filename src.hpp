@@ -33,58 +33,11 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     // Move Q to SRAM for computation
     gpu_sim.MoveMatrixToSharedMem(Q);
 
-    // Build K_stack (i+1, d) and V_stack (i+1, d) in SRAM using rows 0..i
-    Matrix *K_stack = BuildStacked(matrix_memory_allocator, gpu_sim, keys, i);
-    Matrix *V_stack = BuildStacked(matrix_memory_allocator, gpu_sim, values, i);
-
-    // Transpose K_stack in place -> shape (d, i+1)
-    gpu_sim.Transpose(K_stack, Position::kInSharedMemory);
-
-    // S = Q (i+1,d) @ K_stack (d,i+1) -> (i+1,i+1)
-    Matrix *S = matrix_memory_allocator.Allocate("scores");
-    gpu_sim.MatMul(Q, K_stack, S);
-
-    // E = exp(S) elementwise (still (i+1,i+1))
-    Matrix *E = matrix_memory_allocator.Allocate("exp_scores");
-    gpu_sim.MatExp(S, E);
-
-    // Build softmax matrix W row-by-row in SRAM: each row normalized to sum 1
-    Matrix *W = nullptr;
-    for (size_t r = 0; r <= i; ++r) {
-      Matrix *row_r = matrix_memory_allocator.Allocate("row");
-      gpu_sim.GetRow(E, r, row_r, Position::kInSharedMemory);
-      Matrix *row_sum = matrix_memory_allocator.Allocate("row_sum");
-      gpu_sim.Sum(row_r, row_sum); // 1x1
-      Matrix *row_soft = matrix_memory_allocator.Allocate("row_soft");
-      gpu_sim.MatDiv(row_r, row_sum, row_soft);
-
-      if (r == 0) {
-        // Initialize W by copying first softmax row
-        W = matrix_memory_allocator.Allocate("softmax_init");
-        gpu_sim.Copy(row_soft, W, Position::kInSharedMemory);
-      } else {
-        auto W_new = matrix_memory_allocator.Allocate("softmax_concat");
-        gpu_sim.Concat(W, row_soft, W_new, /*axis=*/0, Position::kInSharedMemory);
-        // Release previous W after concatenation
-        gpu_sim.ReleaseMatrix(W);
-        W = W_new;
-      }
-      // Release temporaries (after they are used by previous ops)
-      gpu_sim.ReleaseMatrix(row_r);
-      gpu_sim.ReleaseMatrix(row_sum);
-      gpu_sim.ReleaseMatrix(row_soft);
-    }
-
-    // Streaming attention computation: build Y row-by-row without forming S/E/W or K/V stacks.
-    // Precondition: Q is in shared memory.
-    // For efficiency, move needed K[j] and V[j] to shared memory once, and transpose K[j] in-place.
+    // Streaming attention computation: build Y row-by-row without forming large intermediate matrices.
+    // Ensure keys/values needed this round are in shared memory.
     for (size_t j = 0; j <= i; ++j) {
       gpu_sim.MoveMatrixToSharedMem(keys[j]);
       gpu_sim.MoveMatrixToSharedMem(values[j]);
-      // Transpose keys[j] to shape (512,1) if still (1,512)
-      if (keys[j]->GetColumnNum() == 512 && keys[j]->GetRowNum() == 1) {
-        gpu_sim.Transpose(keys[j], Position::kInSharedMemory);
-      }
     }
 
     Matrix *Y = nullptr; // final answer (i+1, d)
@@ -98,9 +51,14 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       Matrix *denom = nullptr;
 
       for (size_t j = 0; j <= i; ++j) {
-        // s_rj = Q_row (1,d) @ K[j] (512,1) -> (1,1)
+        // Prepare K[j]^T as a column without modifying original keys[j]
+        Matrix *K_col = matrix_memory_allocator.Allocate("K_col");
+        gpu_sim.Copy(keys[j], K_col, Position::kInSharedMemory);
+        gpu_sim.Transpose(K_col, Position::kInSharedMemory); // (d,1)
+
+        // s_rj = Q_row (1,d) @ K_col (d,1) -> (1,1)
         Matrix *s_rj = matrix_memory_allocator.Allocate("s_rj");
-        gpu_sim.MatMul(Q_row, keys[j], s_rj);
+        gpu_sim.MatMul(Q_row, K_col, s_rj);
         Matrix *e_rj = matrix_memory_allocator.Allocate("e_rj");
         gpu_sim.MatExp(s_rj, e_rj);
 
@@ -117,7 +75,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
 
         // Accumulate y_num += e_rj * V[j]
         Matrix *scaled_v = matrix_memory_allocator.Allocate("scaled_v");
-        gpu_sim.MatMul(e_rj, values[j], scaled_v);
+        gpu_sim.MatMul(e_rj, values[j], scaled_v); // (1,1) x (1,d) -> (1,d)
         if (j == 0) {
           y_num = matrix_memory_allocator.Allocate("y_num");
           gpu_sim.Copy(scaled_v, y_num, Position::kInSharedMemory);
@@ -129,6 +87,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         }
 
         // Release small temporaries
+        gpu_sim.ReleaseMatrix(K_col);
         gpu_sim.ReleaseMatrix(s_rj);
         gpu_sim.ReleaseMatrix(e_rj);
         gpu_sim.ReleaseMatrix(scaled_v);
